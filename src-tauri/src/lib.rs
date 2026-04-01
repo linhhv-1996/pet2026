@@ -349,13 +349,14 @@ fn setup_pet_window(app: &mut App) -> tauri::Result<()> {
         (1440.0, 900.0)
     };
 
+    // Bỏ always_on_top — sẽ set level thủ công bên dưới
     let window = WebviewWindowBuilder::new(app, "pet", WebviewUrl::App("/".into()))
         .title("")
         .inner_size(sw, sh)
         .position(0.0, 0.0)
         .decorations(false)
         .transparent(true)
-        .always_on_top(true)
+        .always_on_top(false)
         .resizable(false)
         .shadow(false)
         .visible_on_all_workspaces(true)
@@ -363,8 +364,74 @@ fn setup_pet_window(app: &mut App) -> tauri::Result<()> {
 
     window.show()?;
     let _ = window.set_ignore_cursor_events(true);
-    println!("[PET] ✅ window ready");
+
+    // Set NSWindowLevel cao hơn fullscreen
+    #[cfg(target_os = "macos")]
+    unsafe {
+        set_window_above_fullscreen(&window);
+    }
+
+    println!("[PET] ✅ window ready (above fullscreen)");
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn set_window_above_fullscreen(window: &tauri::WebviewWindow) {
+    use std::ffi::c_void;
+
+    // Lấy NSWindow raw pointer
+    let ns_win = match window.ns_window() {
+        Ok(ptr) => ptr as *mut c_void,
+        Err(e) => {
+            println!("[PET] ❌ ns_window() failed: {:?}", e);
+            return;
+        }
+    };
+
+    // NSWindowLevel constants:
+    // NSNormalWindowLevel      =  0
+    // NSFloatingWindowLevel    =  3   (floating panels)
+    // NSSubmenuWindowLevel     =  3
+    // NSTornOffMenuWindowLevel =  3
+    // NSModalPanelWindowLevel  =  8
+    // NSMainMenuWindowLevel    = 24
+    // NSStatusWindowLevel      = 25
+    // NSPopUpMenuWindowLevel   = 101
+    // NSScreenSaverWindowLevel = 1000  ← đè lên fullscreen app
+    //
+    // Fullscreen app chạy ở level ~500-999 tuỳ macOS version
+    // Dùng 1000 (kCGScreenSaverWindowLevel) là safe nhất
+
+    #[link(name = "AppKit", kind = "framework")]
+    extern "C" {
+        // id objc_msgSend(id self, SEL op, ...)
+        fn objc_msgSend(receiver: *mut c_void, sel: *const c_void, ...) -> *mut c_void;
+        fn sel_registerName(name: *const i8) -> *const c_void;
+    }
+
+    let sel_set_level = {
+        let name = b"setLevel:\0";
+        sel_registerName(name.as_ptr() as *const i8)
+    };
+    let sel_set_collection_behavior = {
+        let name = b"setCollectionBehavior:\0";
+        sel_registerName(name.as_ptr() as *const i8)
+    };
+
+    // setLevel: 1000 (kCGScreenSaverWindowLevel) — trên fullscreen
+    objc_msgSend(ns_win, sel_set_level, 1000i64);
+
+    // NSWindowCollectionBehavior flags:
+    // NSWindowCollectionBehaviorCanJoinAllSpaces    = 1 << 0  (hiện ở mọi Space)
+    // NSWindowCollectionBehaviorStationary          = 1 << 4  (không bị Exposé ẩn)
+    // NSWindowCollectionBehaviorIgnoresCycle        = 1 << 6  (không xuất hiện khi Cmd+Tab)
+    // NSWindowCollectionBehaviorFullScreenAuxiliary = 1 << 8  (hiện khi app khác fullscreen)
+    //
+    // Combine: CanJoinAllSpaces | Stationary | IgnoresCycle | FullScreenAuxiliary
+    let behavior: u64 = (1 << 0) | (1 << 4) | (1 << 6) | (1 << 8);
+    objc_msgSend(ns_win, sel_set_collection_behavior, behavior);
+
+    println!("[PET] 🪟 NSWindowLevel=1000, CollectionBehavior={:#b}", behavior);
 }
 
 #[tauri::command]
