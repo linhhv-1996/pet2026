@@ -57,8 +57,7 @@ pub fn run() {
                 }
             });
 
-            // Thread 2: CGEventTap — intercept + consume clicks trên vùng pet
-            // Đây là cách duy nhất để "ăn" click không cho macOS xử lý
+            // Thread 2: CGEventTap — handle click + drag
             let handle2 = app.handle().clone();
             let rect2 = Arc::clone(&pet_rect);
             thread::spawn(move || {
@@ -76,10 +75,7 @@ pub fn run() {
 }
 
 // =============================================
-// CGEventTap: intercept mouse events ở system level
-// Nếu click nằm trong pet rect → consume (không forward)
-//                               → eval __onPetClicked()
-// Nếu không → forward bình thường
+// CGEventTap
 // =============================================
 #[cfg(target_os = "macos")]
 unsafe fn run_event_tap(
@@ -88,28 +84,26 @@ unsafe fn run_event_tap(
 ) {
     use std::os::raw::c_void;
 
-    type CFMachPortRef   = *mut c_void;
+    type CFMachPortRef      = *mut c_void;
     type CFRunLoopSourceRef = *mut c_void;
-    type CFRunLoopRef    = *mut c_void;
-    type CGEventRef      = *mut c_void;
-    type CGEventMask     = u64;
-    type CGEventType     = u32;
+    type CFRunLoopRef       = *mut c_void;
+    type CGEventRef         = *mut c_void;
+    type CGEventMask        = u64;
+    type CGEventType        = u32;
     type CGEventTapLocation  = u32;
     type CGEventTapPlacement = u32;
     type CGEventTapOptions   = u32;
 
-    // Event types
-    const K_CG_EVENT_LEFT_MOUSE_DOWN: CGEventType = 1;
-    const K_CG_EVENT_LEFT_MOUSE_UP:   CGEventType = 2;
+    const K_CG_EVENT_LEFT_MOUSE_DOWN:    CGEventType = 1;
+    const K_CG_EVENT_LEFT_MOUSE_UP:      CGEventType = 2;
+    const K_CG_EVENT_LEFT_MOUSE_DRAGGED: CGEventType = 6;
 
-    // kCGHeadInsertEventTap = 0 — intercept TRƯỚC khi hệ thống xử lý
-    const K_CG_HEAD_INSERT_EVENT_TAP: CGEventTapPlacement = 0;
-    // kCGSessionEventTap = 1
-    const K_CG_SESSION_EVENT_TAP: CGEventTapLocation = 1;
-    // kCGEventTapOptionDefault = 0 — có thể modify/drop event
-    const K_CG_EVENT_TAP_OPTION_DEFAULT: CGEventTapOptions = 0;
+    const K_CG_HEAD_INSERT_EVENT_TAP:    CGEventTapPlacement = 0;
+    const K_CG_SESSION_EVENT_TAP:        CGEventTapLocation  = 1;
+    const K_CG_EVENT_TAP_OPTION_DEFAULT: CGEventTapOptions   = 0;
 
     #[repr(C)]
+    #[derive(Copy, Clone)]
     struct CGPoint { x: f64, y: f64 }
 
     #[link(name = "CoreGraphics", kind = "framework")]
@@ -129,14 +123,12 @@ unsafe fn run_event_tap(
         ) -> CFMachPortRef;
 
         fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
-
+        fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
         fn CFMachPortCreateRunLoopSource(
             alloc: *const c_void,
             tap: CFMachPortRef,
             order: isize,
         ) -> CFRunLoopSourceRef;
-
-        fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
     }
 
     #[link(name = "CoreFoundation", kind = "framework")]
@@ -147,12 +139,20 @@ unsafe fn run_event_tap(
         static kCFRunLoopCommonModes: *const c_void;
     }
 
-    // UserInfo truyền vào callback
+    // State của drag
+    struct DragState {
+        // Đang drag pet không
+        dragging: bool,
+        // Offset từ góc trái pet đến điểm grab
+        offset_x: f64,
+        offset_y: f64,
+    }
+
     struct TapContext {
-        rect:   Arc<Mutex<PetRect>>,
-        handle: tauri::AppHandle,
-        // Track mouse down position để detect click (down+up cùng vùng)
+        rect:       Arc<Mutex<PetRect>>,
+        handle:     tauri::AppHandle,
         down_in_pet: Mutex<bool>,
+        drag:       Mutex<DragState>,
     }
 
     extern "C" fn event_callback(
@@ -164,51 +164,121 @@ unsafe fn run_event_tap(
         unsafe {
             let ctx = &*(user_info as *const TapContext);
             let loc = CGEventGetLocation(event);
-            let r   = ctx.rect.lock().unwrap();
-
-            let in_pet = loc.x >= r.x && loc.x <= r.x + r.w
-                      && loc.y >= r.y && loc.y <= r.y + r.h;
-            drop(r);
 
             match event_type {
+                // ── MOUSE DOWN ──────────────────────────────────
                 K_CG_EVENT_LEFT_MOUSE_DOWN => {
+                    let r = ctx.rect.lock().unwrap();
+                    let in_pet = loc.x >= r.x && loc.x <= r.x + r.w
+                              && loc.y >= r.y && loc.y <= r.y + r.h;
+
                     *ctx.down_in_pet.lock().unwrap() = in_pet;
+
                     if in_pet {
-                        println!("[PET] 🖱️  tap DOWN in pet — consuming");
-                        // Trả về null = drop event, macOS không nhận
-                        return std::ptr::null_mut();
+                        // Lưu offset để drag mượt (grab point relative to pet corner)
+                        let mut drag = ctx.drag.lock().unwrap();
+                        drag.dragging = false; // chưa drag, chờ xem có move không
+                        drag.offset_x = loc.x - r.x;
+                        drag.offset_y = loc.y - r.y;
+                        drop(drag);
+                        drop(r);
+
+                        println!("[PET] 🖱️  DOWN in pet at ({:.0},{:.0})", loc.x, loc.y);
+                        return std::ptr::null_mut(); // consume
                     }
                 }
+
+                // ── MOUSE DRAGGED ────────────────────────────────
+                K_CG_EVENT_LEFT_MOUSE_DRAGGED => {
+                    let was_down_in = *ctx.down_in_pet.lock().unwrap();
+                    if !was_down_in { return event; }
+
+                    let mut drag = ctx.drag.lock().unwrap();
+
+                    // Lần đầu move → bắt đầu drag
+                    if !drag.dragging {
+                        drag.dragging = true;
+                        // Báo frontend bắt đầu drag (tạm dừng AI behavior)
+                        if let Some(w) = ctx.handle.get_webview_window("pet") {
+                            let _ = w.eval("window.__onPetDragStart()");
+                        }
+                    }
+
+                    // Tính vị trí pet mới: cursor - offset
+                    let new_x = loc.x - drag.offset_x;
+                    let new_y = loc.y - drag.offset_y;
+                    drop(drag);
+
+                    // Cập nhật rect trong Rust
+                    {
+                        let mut r = ctx.rect.lock().unwrap();
+                        r.x = new_x;
+                        r.y = new_y;
+                    }
+
+                    // Cập nhật vị trí trên frontend
+                    if let Some(w) = ctx.handle.get_webview_window("pet") {
+                        let js = format!(
+                            "window.__onPetDrag({:.1},{:.1})",
+                            new_x, new_y
+                        );
+                        let _ = w.eval(&js);
+                    }
+
+                    return std::ptr::null_mut(); // consume drag event
+                }
+
+                // ── MOUSE UP ─────────────────────────────────────
                 K_CG_EVENT_LEFT_MOUSE_UP => {
                     let was_down_in = *ctx.down_in_pet.lock().unwrap();
                     *ctx.down_in_pet.lock().unwrap() = false;
-                    if was_down_in && in_pet {
-                        println!("[PET] ✅ tap UP in pet — fire click, consuming");
+
+                    if !was_down_in { return event; }
+
+                    let mut drag = ctx.drag.lock().unwrap();
+                    let was_dragging = drag.dragging;
+                    drag.dragging = false;
+                    drop(drag);
+
+                    if was_dragging {
+                        // Thả ra sau drag → báo frontend kết thúc drag
+                        println!("[PET] 🖱️  drag END at ({:.0},{:.0})", loc.x, loc.y);
+                        if let Some(w) = ctx.handle.get_webview_window("pet") {
+                            let _ = w.eval("window.__onPetDragEnd()");
+                        }
+                    } else {
+                        // Không drag → là click thuần
+                        println!("[PET] ✅ click in pet");
                         if let Some(w) = ctx.handle.get_webview_window("pet") {
                             let _ = w.eval("window.__onPetClicked()");
                         }
-                        return std::ptr::null_mut();
                     }
+
+                    return std::ptr::null_mut(); // consume
                 }
+
                 _ => {}
             }
 
-            // Forward event bình thường
-            event
+            event // forward
         }
     }
 
-    // Box context lên heap, leak để giữ lifetime suốt app
     let ctx = Box::new(TapContext {
         rect:        rect,
         handle:      handle,
         down_in_pet: Mutex::new(false),
+        drag: Mutex::new(DragState {
+            dragging: false,
+            offset_x: 0.0,
+            offset_y: 0.0,
+        }),
     });
     let ctx_ptr = Box::into_raw(ctx) as *mut c_void;
 
-    // Mask: chỉ listen LEFT_MOUSE_DOWN và LEFT_MOUSE_UP
     let mask: CGEventMask = (1 << K_CG_EVENT_LEFT_MOUSE_DOWN)
-                          | (1 << K_CG_EVENT_LEFT_MOUSE_UP);
+                          | (1 << K_CG_EVENT_LEFT_MOUSE_UP)
+                          | (1 << K_CG_EVENT_LEFT_MOUSE_DRAGGED);
 
     let tap = CGEventTapCreate(
         K_CG_SESSION_EVENT_TAP,
@@ -220,20 +290,17 @@ unsafe fn run_event_tap(
     );
 
     if tap.is_null() {
-        println!("[PET] ❌ CGEventTapCreate failed — cần quyền Accessibility!");
-        println!("[PET]    Vào System Settings → Privacy → Accessibility → bật app");
+        println!("[PET] ❌ CGEventTapCreate failed — cần Accessibility permission!");
         return;
     }
 
-    println!("[PET] ✅ CGEventTap created successfully");
+    println!("[PET] ✅ CGEventTap ready (click + drag)");
     CGEventTapEnable(tap, true);
 
     let source = CFMachPortCreateRunLoopSource(std::ptr::null(), tap, 0);
     let rl = CFRunLoopGetCurrent();
     CFRunLoopAddSource(rl, source, kCFRunLoopCommonModes);
-
-    println!("[PET] 🔄 CGEventTap run loop running...");
-    CFRunLoopRun(); // Block thread này, chạy event loop
+    CFRunLoopRun();
 }
 
 #[tauri::command]
@@ -296,7 +363,7 @@ fn setup_pet_window(app: &mut App) -> tauri::Result<()> {
 
     window.show()?;
     let _ = window.set_ignore_cursor_events(true);
-    println!("[PET] ✅ window ready, ignore_cursor=true");
+    println!("[PET] ✅ window ready");
     Ok(())
 }
 

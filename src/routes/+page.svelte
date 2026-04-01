@@ -21,20 +21,17 @@
     ],
     run:  ['Alien_RUN_1.png', 'Alien_RUN_2.png', 'Alien_RUN_3.png', 'Alien_RUN_4.png'],
     jump: [
-      'Alien_JUMP.png',
-      'Alien_JUMP.png',
-      'Alien_FALL_1.png',
-      'Alien_FALL_2.png',
-      'Alien_FALL_1.png',
-      'Alien_FALL_2.png',
+      'Alien_JUMP.png', 'Alien_JUMP.png'
     ],
     fall: ['Alien_FALL_1.png', 'Alien_FALL_2.png'],
     hit:  ['Alien_HIT_1.png', 'Alien_HIT_2.png', 'Alien_HIT_1.png', 'Alien_HIT_2.png'],
     dead: ['Alien_DEAD.png'],
+    // Drag: dùng JUMP frame (đang bị nhấc lên)
+    drag: ['Alien_JUMP.png'],
   };
 
   const ANIM_FPS: Record<string, number> = {
-    idle: 7, run: 10, jump: 9, fall: 8, hit: 12, dead: 2,
+    idle: 12, run: 12, jump: 12, fall: 12, hit: 12, dead: 2, drag: 2,
   };
 
   const images: Record<string, HTMLImageElement> = {};
@@ -45,31 +42,34 @@
   let canvas: HTMLCanvasElement;
   let ctx: CanvasRenderingContext2D;
 
-  const WALK_SPEED   = 3.0;
-  const FALL_GRAVITY = 6.5;
-  const JUMP_FORCE   = -37;
+  const WALK_SPEED   = 2.2;
+  const FALL_GRAVITY = 5.9;
+  const JUMP_FORCE   = -35;
 
   let petX = 200;
   let petY = 0;
   let vx = WALK_SPEED;
   let vy = 0;
   let facingLeft = false;
+  let isDragging = false;
 
-  type PetState = 'idle' | 'run' | 'jump' | 'fall' | 'hit' | 'dead';
+  type PetState = 'idle' | 'run' | 'jump' | 'fall' | 'hit' | 'dead' | 'drag';
   let state: PetState = 'idle';
   let prevState: PetState = 'idle';
+  let stateBeforeDrag: PetState = 'idle';
 
   let animFrameIndex = 0;
   let rafId: number;
   let lastFrameTime = 0;
   let behaviorTimeout: ReturnType<typeof setTimeout>;
 
-  let targetWin: WinInfo | null = null;
   let openWindows: WinInfo[] = [];
+  let targetWin: WinInfo | null = null;
 
   // Throttle update_pet_rect ~30fps
   let lastRectUpdate = 0;
   function maybeUpdateRect() {
+    if (isDragging) return; // Rust đã biết vị trí qua drag, không cần update ngược lại
     const now = performance.now();
     if (now - lastRectUpdate > 32) {
       lastRectUpdate = now;
@@ -78,27 +78,56 @@
   }
 
   onMount(async () => {
-    petY = window.innerHeight - DISPLAY - 10;
+    petY = window.innerHeight - DISPLAY;
     ctx = canvas.getContext('2d')!;
     ctx.imageSmoothingEnabled = false;
 
     await preloadAll();
 
-    // Đăng ký global callbacks để Rust gọi qua eval()
-    // Đây là cách bypass ignore_cursor_events IPC block
+    invoke('update_pet_rect', { x: petX, y: petY, w: DISPLAY, h: DISPLAY });
+    await invoke('request_accessibility');
+
+    // ── Callbacks từ Rust qua eval() ──────────────────
+
     (window as any).__onPetClicked = () => {
-      console.log('[PET] __onPetClicked called!');
       handlePetClick();
+    };
+
+    // Rust báo bắt đầu drag
+    (window as any).__onPetDragStart = () => {
+      isDragging = true;
+      stateBeforeDrag = state;
+      clearTimeout(behaviorTimeout);
+      enterState('drag');
+    };
+
+    // Rust gửi tọa độ mới liên tục khi drag
+    (window as any).__onPetDrag = (x: number, y: number) => {
+      petX = x;
+      petY = y;
+    };
+
+    // Rust báo thả ra
+    (window as any).__onPetDragEnd = () => {
+      isDragging = false;
+      // Cập nhật rect lần cuối với vị trí mới
+      invoke('update_pet_rect', { x: petX, y: petY, w: DISPLAY, h: DISPLAY });
+
+      // Thả ra → rơi xuống đất (trừ khi đang ở gần đất rồi)
+      const gY = window.innerHeight - DISPLAY;
+      if (petY < gY - 5) {
+        vy = 2; // rơi nhẹ
+        enterState('fall');
+      } else {
+        petY = gY;
+        enterState('idle');
+        scheduleNextBehavior();
+      }
     };
 
     (window as any).__onWindowsUpdated = (wins: WinInfo[]) => {
       openWindows = wins;
     };
-
-    // Gửi rect ban đầu
-    invoke('update_pet_rect', { x: petX, y: petY, w: DISPLAY, h: DISPLAY });
-
-    await invoke('request_accessibility');
 
     enterState('idle');
     scheduleNextBehavior();
@@ -109,6 +138,9 @@
     cancelAnimationFrame(rafId);
     clearTimeout(behaviorTimeout);
     delete (window as any).__onPetClicked;
+    delete (window as any).__onPetDragStart;
+    delete (window as any).__onPetDrag;
+    delete (window as any).__onPetDragEnd;
     delete (window as any).__onWindowsUpdated;
   });
 
@@ -125,9 +157,7 @@
     });
   }
 
-  // =============================================
-  // ANIMATION LOOP
-  // =============================================
+  // ── ANIMATION LOOP ────────────────────────────────────
   function loop(now: number) {
     const fps = ANIM_FPS[state] ?? 8;
     if (now - lastFrameTime >= 1000 / fps) {
@@ -159,12 +189,13 @@
     }
 
     animFrameIndex = (animFrameIndex + 1) % frames.length;
-    updatePhysics();
+
+    if (!isDragging) updatePhysics();
     maybeUpdateRect();
   }
 
   function updatePhysics() {
-    const gY = window.innerHeight - DISPLAY - 10;
+    const gY = window.innerHeight - DISPLAY;
 
     if (state === 'run') {
       petX += vx;
@@ -197,9 +228,7 @@
     animFrameIndex = 0;
   }
 
-  // =============================================
-  // IDLE BEHAVIOR SCHEDULER
-  // =============================================
+  // ── IDLE BEHAVIOR ─────────────────────────────────────
   function scheduleNextBehavior() {
     clearTimeout(behaviorTimeout);
     if (state !== 'idle') return;
@@ -222,14 +251,11 @@
     }
   }
 
-  // =============================================
-  // CLICK HANDLER — gọi bởi Rust qua eval()
-  // =============================================
+  // ── CLICK ─────────────────────────────────────────────
   function handlePetClick() {
-    if (state === 'jump' || state === 'fall') return;
+    if (state === 'jump' || state === 'fall' || isDragging) return;
     clearTimeout(behaviorTimeout);
-
-    enterState('hit');
+    // enterState('hit');
     setTimeout(() => {
       vy = JUMP_FORCE;
       vx = (Math.random() < 0.5 ? 1 : -1) * (2 + Math.random() * 2);
@@ -245,7 +271,7 @@
     width={DISPLAY}
     height={DISPLAY}
     class="pet"
-    style="left: {petX}px; top: {petY}px;"
+    style="left: {petX}px; top: {petY}px; cursor: {isDragging ? 'grabbing' : 'grab'};"
   ></canvas>
 </div>
 
