@@ -3,7 +3,7 @@ mod windows;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
     tray::TrayIconBuilder,
@@ -27,8 +27,14 @@ struct PetRect {
     h: f64,
 }
 
+// Ngưỡng AFK: không có input trong 45 giây
+const AFK_THRESHOLD_SECS: u64 = 45;
+
 pub fn run() {
     let pet_rect = Arc::new(Mutex::new(PetRect::default()));
+
+    // Shared: thời điểm input cuối cùng từ user
+    let last_input = Arc::new(Mutex::new(Instant::now()));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -57,14 +63,22 @@ pub fn run() {
                 }
             });
 
-            // Thread 2: CGEventTap — handle click + drag
+            // Thread 2: CGEventTap — handle click + drag + track input time
             let handle2 = app.handle().clone();
-            let rect2 = Arc::clone(&pet_rect);
+            let rect2       = Arc::clone(&pet_rect);
+            let last_input2 = Arc::clone(&last_input);
             thread::spawn(move || {
                 #[cfg(target_os = "macos")]
                 unsafe {
-                    run_event_tap(handle2, rect2);
+                    run_event_tap(handle2, rect2, last_input2);
                 }
+            });
+
+            // Thread 3: AFK watcher
+            let handle3     = app.handle().clone();
+            let last_input3 = Arc::clone(&last_input);
+            thread::spawn(move || {
+                afk_watcher(handle3, last_input3);
             });
 
             app.manage(Arc::clone(&pet_rect));
@@ -75,12 +89,47 @@ pub fn run() {
 }
 
 // =============================================
+// AFK Watcher
+// =============================================
+
+fn afk_watcher(handle: tauri::AppHandle, last_input: Arc<Mutex<Instant>>) {
+    // true = đang ở trạng thái AFK (đã fire __onUserAFK rồi)
+    let mut is_afk = false;
+
+    loop {
+        thread::sleep(Duration::from_secs(5)); // check mỗi 5 giây là đủ
+
+        let elapsed = {
+            let t = last_input.lock().unwrap();
+            t.elapsed()
+        };
+
+        if !is_afk && elapsed >= Duration::from_secs(AFK_THRESHOLD_SECS) {
+            // Vừa trở thành AFK
+            is_afk = true;
+            println!("[PET] 💤 User AFK ({:.0}s idle)", elapsed.as_secs_f64());
+            if let Some(w) = handle.get_webview_window("pet") {
+                let _ = w.eval("window.__onUserAFK && window.__onUserAFK()");
+            }
+        } else if is_afk && elapsed < Duration::from_secs(AFK_THRESHOLD_SECS) {
+            // User active trở lại (last_input đã được reset bởi event tap)
+            is_afk = false;
+            println!("[PET] 👋 User active again");
+            if let Some(w) = handle.get_webview_window("pet") {
+                let _ = w.eval("window.__onUserActive && window.__onUserActive()");
+            }
+        }
+    }
+}
+
+// =============================================
 // CGEventTap
 // =============================================
 #[cfg(target_os = "macos")]
 unsafe fn run_event_tap(
     handle: tauri::AppHandle,
     rect: Arc<Mutex<PetRect>>,
+    last_input: Arc<Mutex<Instant>>,
 ) {
     use std::os::raw::c_void;
 
@@ -97,6 +146,9 @@ unsafe fn run_event_tap(
     const K_CG_EVENT_LEFT_MOUSE_DOWN:    CGEventType = 1;
     const K_CG_EVENT_LEFT_MOUSE_UP:      CGEventType = 2;
     const K_CG_EVENT_LEFT_MOUSE_DRAGGED: CGEventType = 6;
+    const K_CG_EVENT_MOUSE_MOVED:        CGEventType = 5;
+    const K_CG_EVENT_KEY_DOWN:           CGEventType = 10;
+    const K_CG_EVENT_SCROLL_WHEEL:       CGEventType = 22;
 
     const K_CG_HEAD_INSERT_EVENT_TAP:    CGEventTapPlacement = 0;
     const K_CG_SESSION_EVENT_TAP:        CGEventTapLocation  = 1;
@@ -139,20 +191,18 @@ unsafe fn run_event_tap(
         static kCFRunLoopCommonModes: *const c_void;
     }
 
-    // State của drag
     struct DragState {
-        // Đang drag pet không
         dragging: bool,
-        // Offset từ góc trái pet đến điểm grab
         offset_x: f64,
         offset_y: f64,
     }
 
     struct TapContext {
-        rect:       Arc<Mutex<PetRect>>,
-        handle:     tauri::AppHandle,
+        rect:        Arc<Mutex<PetRect>>,
+        handle:      tauri::AppHandle,
+        last_input:  Arc<Mutex<Instant>>,
         down_in_pet: Mutex<bool>,
-        drag:       Mutex<DragState>,
+        drag:        Mutex<DragState>,
     }
 
     extern "C" fn event_callback(
@@ -165,6 +215,13 @@ unsafe fn run_event_tap(
             let ctx = &*(user_info as *const TapContext);
             let loc = CGEventGetLocation(event);
 
+            // Bất kỳ input nào → reset AFK timer
+            // (trừ drag của chính pet để tránh ếch tự đánh thức mình)
+            let is_pet_drag = *ctx.down_in_pet.lock().unwrap();
+            if !is_pet_drag {
+                *ctx.last_input.lock().unwrap() = Instant::now();
+            }
+
             match event_type {
                 // ── MOUSE DOWN ──────────────────────────────────
                 K_CG_EVENT_LEFT_MOUSE_DOWN => {
@@ -175,16 +232,15 @@ unsafe fn run_event_tap(
                     *ctx.down_in_pet.lock().unwrap() = in_pet;
 
                     if in_pet {
-                        // Lưu offset để drag mượt (grab point relative to pet corner)
                         let mut drag = ctx.drag.lock().unwrap();
-                        drag.dragging = false; // chưa drag, chờ xem có move không
+                        drag.dragging = false;
                         drag.offset_x = loc.x - r.x;
                         drag.offset_y = loc.y - r.y;
                         drop(drag);
                         drop(r);
 
                         println!("[PET] 🖱️  DOWN in pet at ({:.0},{:.0})", loc.x, loc.y);
-                        return std::ptr::null_mut(); // consume
+                        return std::ptr::null_mut();
                     }
                 }
 
@@ -195,37 +251,30 @@ unsafe fn run_event_tap(
 
                     let mut drag = ctx.drag.lock().unwrap();
 
-                    // Lần đầu move → bắt đầu drag
                     if !drag.dragging {
                         drag.dragging = true;
-                        // Báo frontend bắt đầu drag (tạm dừng AI behavior)
+                        // Nhấc pet lên → Shock (sợ hãi), không phải Jump
                         if let Some(w) = ctx.handle.get_webview_window("pet") {
                             let _ = w.eval("window.__onPetDragStart()");
                         }
                     }
 
-                    // Tính vị trí pet mới: cursor - offset
                     let new_x = loc.x - drag.offset_x;
                     let new_y = loc.y - drag.offset_y;
                     drop(drag);
 
-                    // Cập nhật rect trong Rust
                     {
                         let mut r = ctx.rect.lock().unwrap();
                         r.x = new_x;
                         r.y = new_y;
                     }
 
-                    // Cập nhật vị trí trên frontend
                     if let Some(w) = ctx.handle.get_webview_window("pet") {
-                        let js = format!(
-                            "window.__onPetDrag({:.1},{:.1})",
-                            new_x, new_y
-                        );
+                        let js = format!("window.__onPetDrag({:.1},{:.1})", new_x, new_y);
                         let _ = w.eval(&js);
                     }
 
-                    return std::ptr::null_mut(); // consume drag event
+                    return std::ptr::null_mut();
                 }
 
                 // ── MOUSE UP ─────────────────────────────────────
@@ -233,40 +282,41 @@ unsafe fn run_event_tap(
                     let was_down_in = *ctx.down_in_pet.lock().unwrap();
                     *ctx.down_in_pet.lock().unwrap() = false;
 
-                    if !was_down_in { return event; }
-
-                    let mut drag = ctx.drag.lock().unwrap();
-                    let was_dragging = drag.dragging;
-                    drag.dragging = false;
-                    drop(drag);
-
-                    if was_dragging {
-                        // Thả ra sau drag → báo frontend kết thúc drag
-                        println!("[PET] 🖱️  drag END at ({:.0},{:.0})", loc.x, loc.y);
-                        if let Some(w) = ctx.handle.get_webview_window("pet") {
-                            let _ = w.eval("window.__onPetDragEnd()");
+                    if was_down_in {
+                        let dragging = ctx.drag.lock().unwrap().dragging;
+                        if dragging {
+                            ctx.drag.lock().unwrap().dragging = false;
+                            println!("[PET] 🖱️  drag end");
+                            if let Some(w) = ctx.handle.get_webview_window("pet") {
+                                let _ = w.eval("window.__onPetDragEnd()");
+                            }
+                        } else {
+                            println!("[PET] ✅ click in pet");
+                            if let Some(w) = ctx.handle.get_webview_window("pet") {
+                                let _ = w.eval("window.__onPetClicked()");
+                            }
                         }
-                    } else {
-                        // Không drag → là click thuần
-                        println!("[PET] ✅ click in pet");
-                        if let Some(w) = ctx.handle.get_webview_window("pet") {
-                            let _ = w.eval("window.__onPetClicked()");
-                        }
+
+                        return std::ptr::null_mut();
                     }
-
-                    return std::ptr::null_mut(); // consume
                 }
+
+                // Input events khác → chỉ dùng để reset AFK timer (đã xử lý ở trên)
+                K_CG_EVENT_MOUSE_MOVED
+                | K_CG_EVENT_KEY_DOWN
+                | K_CG_EVENT_SCROLL_WHEEL => {}
 
                 _ => {}
             }
 
-            event // forward
+            event
         }
     }
 
     let ctx = Box::new(TapContext {
         rect:        rect,
         handle:      handle,
+        last_input:  last_input,
         down_in_pet: Mutex::new(false),
         drag: Mutex::new(DragState {
             dragging: false,
@@ -276,9 +326,13 @@ unsafe fn run_event_tap(
     });
     let ctx_ptr = Box::into_raw(ctx) as *mut c_void;
 
+    // Thêm mouse move, key down, scroll vào mask để track AFK
     let mask: CGEventMask = (1 << K_CG_EVENT_LEFT_MOUSE_DOWN)
                           | (1 << K_CG_EVENT_LEFT_MOUSE_UP)
-                          | (1 << K_CG_EVENT_LEFT_MOUSE_DRAGGED);
+                          | (1 << K_CG_EVENT_LEFT_MOUSE_DRAGGED)
+                          | (1 << K_CG_EVENT_MOUSE_MOVED)
+                          | (1 << K_CG_EVENT_KEY_DOWN)
+                          | (1 << K_CG_EVENT_SCROLL_WHEEL);
 
     let tap = CGEventTapCreate(
         K_CG_SESSION_EVENT_TAP,
@@ -294,7 +348,7 @@ unsafe fn run_event_tap(
         return;
     }
 
-    println!("[PET] ✅ CGEventTap ready (click + drag)");
+    println!("[PET] ✅ CGEventTap ready (click + drag + AFK tracking)");
     CGEventTapEnable(tap, true);
 
     let source = CFMachPortCreateRunLoopSource(std::ptr::null(), tap, 0);
@@ -349,14 +403,13 @@ fn setup_pet_window(app: &mut App) -> tauri::Result<()> {
         (1440.0, 900.0)
     };
 
-    // Bỏ always_on_top — sẽ set level thủ công bên dưới
     let window = WebviewWindowBuilder::new(app, "pet", WebviewUrl::App("/".into()))
         .title("")
         .inner_size(sw, sh)
         .position(0.0, 0.0)
         .decorations(false)
         .transparent(true)
-        .always_on_top(false)
+        .always_on_top(true)
         .resizable(false)
         .shadow(false)
         .visible_on_all_workspaces(true)
@@ -365,7 +418,6 @@ fn setup_pet_window(app: &mut App) -> tauri::Result<()> {
     window.show()?;
     let _ = window.set_ignore_cursor_events(true);
 
-    // Set NSWindowLevel cao hơn fullscreen
     #[cfg(target_os = "macos")]
     unsafe {
         set_window_above_fullscreen(&window);
@@ -379,7 +431,6 @@ fn setup_pet_window(app: &mut App) -> tauri::Result<()> {
 unsafe fn set_window_above_fullscreen(window: &tauri::WebviewWindow) {
     use std::ffi::c_void;
 
-    // Lấy NSWindow raw pointer
     let ns_win = match window.ns_window() {
         Ok(ptr) => ptr as *mut c_void,
         Err(e) => {
@@ -388,23 +439,8 @@ unsafe fn set_window_above_fullscreen(window: &tauri::WebviewWindow) {
         }
     };
 
-    // NSWindowLevel constants:
-    // NSNormalWindowLevel      =  0
-    // NSFloatingWindowLevel    =  3   (floating panels)
-    // NSSubmenuWindowLevel     =  3
-    // NSTornOffMenuWindowLevel =  3
-    // NSModalPanelWindowLevel  =  8
-    // NSMainMenuWindowLevel    = 24
-    // NSStatusWindowLevel      = 25
-    // NSPopUpMenuWindowLevel   = 101
-    // NSScreenSaverWindowLevel = 1000  ← đè lên fullscreen app
-    //
-    // Fullscreen app chạy ở level ~500-999 tuỳ macOS version
-    // Dùng 1000 (kCGScreenSaverWindowLevel) là safe nhất
-
     #[link(name = "AppKit", kind = "framework")]
     extern "C" {
-        // id objc_msgSend(id self, SEL op, ...)
         fn objc_msgSend(receiver: *mut c_void, sel: *const c_void, ...) -> *mut c_void;
         fn sel_registerName(name: *const i8) -> *const c_void;
     }
@@ -418,20 +454,25 @@ unsafe fn set_window_above_fullscreen(window: &tauri::WebviewWindow) {
         sel_registerName(name.as_ptr() as *const i8)
     };
 
-    // setLevel: 1000 (kCGScreenSaverWindowLevel) — trên fullscreen
-    objc_msgSend(ns_win, sel_set_level, 1000i64);
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGWindowLevelForKey(key: i32) -> i32;
+    }
 
-    // NSWindowCollectionBehavior flags:
-    // NSWindowCollectionBehaviorCanJoinAllSpaces    = 1 << 0  (hiện ở mọi Space)
-    // NSWindowCollectionBehaviorStationary          = 1 << 4  (không bị Exposé ẩn)
-    // NSWindowCollectionBehaviorIgnoresCycle        = 1 << 6  (không xuất hiện khi Cmd+Tab)
-    // NSWindowCollectionBehaviorFullScreenAuxiliary = 1 << 8  (hiện khi app khác fullscreen)
-    //
-    // Combine: CanJoinAllSpaces | Stationary | IgnoresCycle | FullScreenAuxiliary
-    let behavior: u64 = (1 << 0) | (1 << 4) | (1 << 6) | (1 << 8);
+    // FIX: kCGScreenSaverWindowLevelKey = 13 (không phải 11)
+    // key 11 = kCGMainMenuWindowLevelKey, thấp hơn fullscreen app
+    let level = CGWindowLevelForKey(14) as i64;
+    objc_msgSend(ns_win, sel_set_level, level);
+
+    // FIX: CollectionBehavior đúng để hiện trên fullscreen
+    // NSWindowCollectionBehaviorCanJoinAllSpaces  = 1 << 0  = 1
+    // NSWindowCollectionBehaviorTransient         = 1 << 3  = 8   (thay Stationary)
+    // NSWindowCollectionBehaviorIgnoresCycle      = 1 << 6  = 64
+    // NSWindowCollectionBehaviorFullScreenAuxiliary = 1 << 8 = 256
+    let behavior: u64 = (1 << 0) | (1 << 6) | (1 << 8);
     objc_msgSend(ns_win, sel_set_collection_behavior, behavior);
 
-    println!("[PET] 🪟 NSWindowLevel=1000, CollectionBehavior={:#b}", behavior);
+    println!("[PET] 🪟 level={} (ScreenSaver), CollectionBehavior={:#b}", level, behavior);
 }
 
 #[tauri::command]
