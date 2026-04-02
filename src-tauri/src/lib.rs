@@ -44,6 +44,9 @@ pub fn run() {
             request_accessibility
         ])
         .setup(move |app| {
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
             setup_tray(app)?;
             setup_pet_window(app)?;
 
@@ -427,53 +430,23 @@ fn setup_pet_window(app: &mut App) -> tauri::Result<()> {
     Ok(())
 }
 
+
 #[cfg(target_os = "macos")]
 unsafe fn set_window_above_fullscreen(window: &tauri::WebviewWindow) {
-    use std::ffi::c_void;
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
 
     let ns_win = match window.ns_window() {
-        Ok(ptr) => ptr as *mut c_void,
-        Err(e) => {
-            println!("[PET] ❌ ns_window() failed: {:?}", e);
-            return;
-        }
+        Ok(ptr) => ptr as *mut AnyObject, // Ép sang AnyObject của objc2
+        Err(_) => return,
     };
 
-    #[link(name = "AppKit", kind = "framework")]
-    extern "C" {
-        fn objc_msgSend(receiver: *mut c_void, sel: *const c_void, ...) -> *mut c_void;
-        fn sel_registerName(name: *const i8) -> *const c_void;
-    }
-
-    let sel_set_level = {
-        let name = b"setLevel:\0";
-        sel_registerName(name.as_ptr() as *const i8)
-    };
-    let sel_set_collection_behavior = {
-        let name = b"setCollectionBehavior:\0";
-        sel_registerName(name.as_ptr() as *const i8)
-    };
-
-    #[link(name = "CoreGraphics", kind = "framework")]
-    extern "C" {
-        fn CGWindowLevelForKey(key: i32) -> i32;
-    }
-
-    // FIX: kCGScreenSaverWindowLevelKey = 13 (không phải 11)
-    // key 11 = kCGMainMenuWindowLevelKey, thấp hơn fullscreen app
-    let level = CGWindowLevelForKey(14) as i64;
-    objc_msgSend(ns_win, sel_set_level, level);
-
-    // FIX: CollectionBehavior đúng để hiện trên fullscreen
-    // NSWindowCollectionBehaviorCanJoinAllSpaces  = 1 << 0  = 1
-    // NSWindowCollectionBehaviorTransient         = 1 << 3  = 8   (thay Stationary)
-    // NSWindowCollectionBehaviorIgnoresCycle      = 1 << 6  = 64
-    // NSWindowCollectionBehaviorFullScreenAuxiliary = 1 << 8 = 256
-    let behavior: u64 = (1 << 0) | (1 << 6) | (1 << 8);
-    objc_msgSend(ns_win, sel_set_collection_behavior, behavior);
-
-    println!("[PET] 🪟 level={} (ScreenSaver), CollectionBehavior={:#b}", level, behavior);
+    let _: () = msg_send![ns_win, setLevel: 25_isize]; // objc2 thích isize/usize hơn
+    
+    let behavior: usize = 1 | 16 | 64 | 256;
+    let _: () = msg_send![ns_win, setCollectionBehavior: behavior];
 }
+
 
 #[tauri::command]
 fn get_windows() -> Vec<WindowInfo> {

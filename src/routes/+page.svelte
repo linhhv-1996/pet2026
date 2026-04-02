@@ -68,7 +68,7 @@
   interface WinInfo { title: string; x: number; y: number; width: number; height: number; }
 
   let state: PetState = 'Idle';
-  let petX = 200;
+  let petX = 15;
   let petY = 0;
   let vx   = WALK_SPEED;
   let vy   = 0;
