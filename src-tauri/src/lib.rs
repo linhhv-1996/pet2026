@@ -1,3 +1,4 @@
+#![allow(unused)]
 mod windows;
 
 use serde::{Deserialize, Serialize};
@@ -27,21 +28,36 @@ struct PetRect {
     h: f64,
 }
 
-// Ngưỡng AFK: không có input trong 45 giây
+#[derive(Debug, Clone)]
+pub struct AppSettings {
+    pub frog: String,
+    pub focus_mins: u32,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self { frog: "Frog_1".into(), focus_mins: 25 }
+    }
+}
+
 const AFK_THRESHOLD_SECS: u64 = 45;
 
 pub fn run() {
-    let pet_rect = Arc::new(Mutex::new(PetRect::default()));
-
-    // Shared: thời điểm input cuối cùng từ user
+    let pet_rect   = Arc::new(Mutex::new(PetRect::default()));
     let last_input = Arc::new(Mutex::new(Instant::now()));
+    let settings   = Arc::new(Mutex::new(AppSettings::default()));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .invoke_handler(tauri::generate_handler![
             update_pet_rect,
             get_windows,
-            request_accessibility
+            request_accessibility,
+            set_frog,
+            set_focus_mins,
+            get_settings,
+            toggle_pet,
+            quit_app,
         ])
         .setup(move |app| {
             #[cfg(target_os = "macos")]
@@ -53,7 +69,6 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
-            // Thread 1: poll windows mỗi 500ms
             let handle = app.handle().clone();
             thread::spawn(move || loop {
                 thread::sleep(Duration::from_millis(500));
@@ -66,58 +81,64 @@ pub fn run() {
                 }
             });
 
-            // Thread 2: CGEventTap — handle click + drag + track input time
-            let handle2 = app.handle().clone();
+            let handle2     = app.handle().clone();
             let rect2       = Arc::clone(&pet_rect);
             let last_input2 = Arc::clone(&last_input);
             thread::spawn(move || {
                 #[cfg(target_os = "macos")]
-                unsafe {
-                    run_event_tap(handle2, rect2, last_input2);
-                }
+                unsafe { run_event_tap(handle2, rect2, last_input2); }
             });
 
-            // Thread 3: AFK watcher
             let handle3     = app.handle().clone();
             let last_input3 = Arc::clone(&last_input);
-            thread::spawn(move || {
-                afk_watcher(handle3, last_input3);
-            });
+            thread::spawn(move || { afk_watcher(handle3, last_input3); });
 
             app.manage(Arc::clone(&pet_rect));
+            app.manage(Arc::clone(&settings));
             Ok(())
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
 
-// =============================================
-// AFK Watcher
-// =============================================
+#[tauri::command]
+fn get_settings(settings: tauri::State<Arc<Mutex<AppSettings>>>) -> (String, u32) {
+    let s = settings.lock().unwrap();
+    (s.frog.clone(), s.focus_mins)
+}
+
+#[tauri::command]
+fn set_frog(frog: String, settings: tauri::State<Arc<Mutex<AppSettings>>>, app: tauri::AppHandle) {
+    let valid = ["Frog_1", "Frog_2", "Frog_3", "Frog_4"];
+    if !valid.contains(&frog.as_str()) { return; }
+    settings.lock().unwrap().frog = frog.clone();
+    if let Some(w) = app.get_webview_window("pet") {
+        let js = format!("window.__onFrogChanged && window.__onFrogChanged('{}')", frog);
+        let _ = w.eval(&js);
+    }
+}
+
+#[tauri::command]
+fn set_focus_mins(mins: u32, settings: tauri::State<Arc<Mutex<AppSettings>>>, app: tauri::AppHandle) {
+    settings.lock().unwrap().focus_mins = mins;
+    if let Some(w) = app.get_webview_window("pet") {
+        let js = format!("window.__onFocusChanged && window.__onFocusChanged({})", mins);
+        let _ = w.eval(&js);
+    }
+}
 
 fn afk_watcher(handle: tauri::AppHandle, last_input: Arc<Mutex<Instant>>) {
-    // true = đang ở trạng thái AFK (đã fire __onUserAFK rồi)
     let mut is_afk = false;
-
     loop {
-        thread::sleep(Duration::from_secs(5)); // check mỗi 5 giây là đủ
-
-        let elapsed = {
-            let t = last_input.lock().unwrap();
-            t.elapsed()
-        };
-
+        thread::sleep(Duration::from_secs(5));
+        let elapsed = { let t = last_input.lock().unwrap(); t.elapsed() };
         if !is_afk && elapsed >= Duration::from_secs(AFK_THRESHOLD_SECS) {
-            // Vừa trở thành AFK
             is_afk = true;
-            println!("[PET] 💤 User AFK ({:.0}s idle)", elapsed.as_secs_f64());
             if let Some(w) = handle.get_webview_window("pet") {
                 let _ = w.eval("window.__onUserAFK && window.__onUserAFK()");
             }
         } else if is_afk && elapsed < Duration::from_secs(AFK_THRESHOLD_SECS) {
-            // User active trở lại (last_input đã được reset bởi event tap)
             is_afk = false;
-            println!("[PET] 👋 User active again");
             if let Some(w) = handle.get_webview_window("pet") {
                 let _ = w.eval("window.__onUserActive && window.__onUserActive()");
             }
@@ -125,9 +146,6 @@ fn afk_watcher(handle: tauri::AppHandle, last_input: Arc<Mutex<Instant>>) {
     }
 }
 
-// =============================================
-// CGEventTap
-// =============================================
 #[cfg(target_os = "macos")]
 unsafe fn run_event_tap(
     handle: tauri::AppHandle,
@@ -135,7 +153,6 @@ unsafe fn run_event_tap(
     last_input: Arc<Mutex<Instant>>,
 ) {
     use std::os::raw::c_void;
-
     type CFMachPortRef      = *mut c_void;
     type CFRunLoopSourceRef = *mut c_void;
     type CFRunLoopRef       = *mut c_void;
@@ -153,8 +170,8 @@ unsafe fn run_event_tap(
     const K_CG_EVENT_KEY_DOWN:           CGEventType = 10;
     const K_CG_EVENT_SCROLL_WHEEL:       CGEventType = 22;
 
-    const K_CG_HEAD_INSERT_EVENT_TAP:    CGEventTapPlacement = 0;
     const K_CG_SESSION_EVENT_TAP:        CGEventTapLocation  = 1;
+    const K_CG_HEAD_INSERT_EVENT_TAP:    CGEventTapPlacement = 0;
     const K_CG_EVENT_TAP_OPTION_DEFAULT: CGEventTapOptions   = 0;
 
     #[repr(C)]
@@ -164,26 +181,14 @@ unsafe fn run_event_tap(
     #[link(name = "CoreGraphics", kind = "framework")]
     extern "C" {
         fn CGEventTapCreate(
-            tap: CGEventTapLocation,
-            place: CGEventTapPlacement,
-            options: CGEventTapOptions,
+            tap: CGEventTapLocation, place: CGEventTapPlacement, options: CGEventTapOptions,
             events_of_interest: CGEventMask,
-            callback: extern "C" fn(
-                proxy: *mut c_void,
-                event_type: CGEventType,
-                event: CGEventRef,
-                user_info: *mut c_void,
-            ) -> CGEventRef,
+            callback: extern "C" fn(*mut c_void, CGEventType, CGEventRef, *mut c_void) -> CGEventRef,
             user_info: *mut c_void,
         ) -> CFMachPortRef;
-
         fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
         fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
-        fn CFMachPortCreateRunLoopSource(
-            alloc: *const c_void,
-            tap: CFMachPortRef,
-            order: isize,
-        ) -> CFRunLoopSourceRef;
+        fn CFMachPortCreateRunLoopSource(alloc: *const c_void, tap: CFMachPortRef, order: isize) -> CFRunLoopSourceRef;
     }
 
     #[link(name = "CoreFoundation", kind = "framework")]
@@ -194,174 +199,126 @@ unsafe fn run_event_tap(
         static kCFRunLoopCommonModes: *const c_void;
     }
 
-    struct DragState {
-        dragging: bool,
-        offset_x: f64,
-        offset_y: f64,
-    }
-
+    struct DragState { dragging: bool, offset_x: f64, offset_y: f64 }
     struct TapContext {
-        rect:        Arc<Mutex<PetRect>>,
-        handle:      tauri::AppHandle,
-        last_input:  Arc<Mutex<Instant>>,
+        rect: Arc<Mutex<PetRect>>,
+        handle: tauri::AppHandle,
+        last_input: Arc<Mutex<Instant>>,
         down_in_pet: Mutex<bool>,
-        drag:        Mutex<DragState>,
+        drag: Mutex<DragState>,
     }
 
-    extern "C" fn event_callback(
-        _proxy: *mut c_void,
-        event_type: CGEventType,
-        event: CGEventRef,
-        user_info: *mut c_void,
-    ) -> CGEventRef {
+    extern "C" fn event_callback(_: *mut c_void, event_type: CGEventType, event: CGEventRef, user_info: *mut c_void) -> CGEventRef {
         unsafe {
             let ctx = &*(user_info as *const TapContext);
             let loc = CGEventGetLocation(event);
-
-            // Bất kỳ input nào → reset AFK timer
-            // (trừ drag của chính pet để tránh ếch tự đánh thức mình)
             let is_pet_drag = *ctx.down_in_pet.lock().unwrap();
+            
             if !is_pet_drag {
                 *ctx.last_input.lock().unwrap() = Instant::now();
             }
 
             match event_type {
-                // ── MOUSE DOWN ──────────────────────────────────
                 K_CG_EVENT_LEFT_MOUSE_DOWN => {
                     let r = ctx.rect.lock().unwrap();
-                    let in_pet = loc.x >= r.x && loc.x <= r.x + r.w
-                              && loc.y >= r.y && loc.y <= r.y + r.h;
-
+                    let in_pet = loc.x >= r.x && loc.x <= r.x + r.w && loc.y >= r.y && loc.y <= r.y + r.h;
                     *ctx.down_in_pet.lock().unwrap() = in_pet;
-
+                    
                     if in_pet {
                         let mut drag = ctx.drag.lock().unwrap();
-                        drag.dragging = false;
-                        drag.offset_x = loc.x - r.x;
-                        drag.offset_y = loc.y - r.y;
-                        drop(drag);
-                        drop(r);
+                        drag.dragging = false; drag.offset_x = loc.x - r.x; drag.offset_y = loc.y - r.y;
+                        drop(drag); drop(r);
+                        return std::ptr::null_mut(); // Block event
+                    } else {
+                        // LOGIC ĐÓNG PANEL VÀ "NUỐT" CLICK (FIX HIỆN SPACE)
+                        let mut consume_click = false;
+                        
+                        if let Some(panel) = ctx.handle.get_webview_window("panel") {
+                            if panel.is_visible().unwrap_or(false) {
+                                if let (Ok(pos), Ok(size)) = (panel.outer_position(), panel.outer_size()) {
+                                    let scale = panel.scale_factor().unwrap_or(1.0);
+                                    let px = pos.x as f64 / scale;
+                                    let py = pos.y as f64 / scale;
+                                    let pw = size.width as f64 / scale;
+                                    let ph = size.height as f64 / scale;
 
-                        println!("[PET] 🖱️  DOWN in pet at ({:.0},{:.0})", loc.x, loc.y);
-                        return std::ptr::null_mut();
+                                    let in_panel = loc.x >= px && loc.x <= px + pw 
+                                                && loc.y >= py && loc.y <= py + ph;
+
+                                    if !in_panel && loc.y > 32.0 {
+                                        consume_click = true;
+                                    }
+                                }
+                            }
+                        }
+
+                        if consume_click {
+                            let handle_clone = ctx.handle.clone();
+                            let _ = ctx.handle.run_on_main_thread(move || {
+                                if let Some(p) = handle_clone.get_webview_window("panel") {
+                                    let _ = p.hide();
+                                }
+                            });
+                            // Trả về null để macOS KHÔNG NHẬN ĐƯỢC cú click này nữa -> Ko bị hiện Desktop
+                            return std::ptr::null_mut();
+                        }
                     }
                 }
-
-                // ── MOUSE DRAGGED ────────────────────────────────
                 K_CG_EVENT_LEFT_MOUSE_DRAGGED => {
                     let was_down_in = *ctx.down_in_pet.lock().unwrap();
                     if !was_down_in { return event; }
-
                     let mut drag = ctx.drag.lock().unwrap();
-
                     if !drag.dragging {
                         drag.dragging = true;
-                        // Nhấc pet lên → Shock (sợ hãi), không phải Jump
-                        if let Some(w) = ctx.handle.get_webview_window("pet") {
-                            let _ = w.eval("window.__onPetDragStart()");
-                        }
+                        if let Some(w) = ctx.handle.get_webview_window("pet") { let _ = w.eval("window.__onPetDragStart()"); }
                     }
-
-                    let new_x = loc.x - drag.offset_x;
-                    let new_y = loc.y - drag.offset_y;
+                    let new_x = loc.x - drag.offset_x; let new_y = loc.y - drag.offset_y;
                     drop(drag);
-
-                    {
-                        let mut r = ctx.rect.lock().unwrap();
-                        r.x = new_x;
-                        r.y = new_y;
-                    }
-
+                    { let mut r = ctx.rect.lock().unwrap(); r.x = new_x; r.y = new_y; }
                     if let Some(w) = ctx.handle.get_webview_window("pet") {
                         let js = format!("window.__onPetDrag({:.1},{:.1})", new_x, new_y);
                         let _ = w.eval(&js);
                     }
-
                     return std::ptr::null_mut();
                 }
-
-                // ── MOUSE UP ─────────────────────────────────────
                 K_CG_EVENT_LEFT_MOUSE_UP => {
                     let was_down_in = *ctx.down_in_pet.lock().unwrap();
                     *ctx.down_in_pet.lock().unwrap() = false;
-
                     if was_down_in {
                         let dragging = ctx.drag.lock().unwrap().dragging;
                         if dragging {
                             ctx.drag.lock().unwrap().dragging = false;
-                            println!("[PET] 🖱️  drag end");
-                            if let Some(w) = ctx.handle.get_webview_window("pet") {
-                                let _ = w.eval("window.__onPetDragEnd()");
-                            }
+                            if let Some(w) = ctx.handle.get_webview_window("pet") { let _ = w.eval("window.__onPetDragEnd()"); }
                         } else {
-                            println!("[PET] ✅ click in pet");
-                            if let Some(w) = ctx.handle.get_webview_window("pet") {
-                                let _ = w.eval("window.__onPetClicked()");
-                            }
+                            if let Some(w) = ctx.handle.get_webview_window("pet") { let _ = w.eval("window.__onPetClicked()"); }
                         }
-
                         return std::ptr::null_mut();
                     }
                 }
-
-                // Input events khác → chỉ dùng để reset AFK timer (đã xử lý ở trên)
-                K_CG_EVENT_KEY_DOWN
-                | K_CG_EVENT_SCROLL_WHEEL => {}
-
                 K_CG_EVENT_MOUSE_MOVED => {
-                // Thêm đoạn code này để gửi tọa độ chuột toàn cầu xuống Frontend
                     if let Some(w) = ctx.handle.get_webview_window("pet") {
-                        // Tọa độ loc là tọa độ toàn cầu từ tầng OS
-                        let js = format!("if(window.__onMouseMove) window.__onMouseMove({:.1}, {:.1});", loc.x, loc.y);
+                        let js = format!("if(window.__onMouseMove) window.__onMouseMove({:.1},{:.1});", loc.x, loc.y);
                         let _ = w.eval(&js);
                     }
                 }
-
                 _ => {}
             }
-
             event
         }
     }
 
     let ctx = Box::new(TapContext {
-        rect:        rect,
-        handle:      handle,
-        last_input:  last_input,
-        down_in_pet: Mutex::new(false),
-        drag: Mutex::new(DragState {
-            dragging: false,
-            offset_x: 0.0,
-            offset_y: 0.0,
-        }),
+        rect, handle, last_input, down_in_pet: Mutex::new(false),
+        drag: Mutex::new(DragState { dragging: false, offset_x: 0.0, offset_y: 0.0 }),
     });
     let ctx_ptr = Box::into_raw(ctx) as *mut c_void;
+    let mask: CGEventMask = (1 << K_CG_EVENT_LEFT_MOUSE_DOWN) | (1 << K_CG_EVENT_LEFT_MOUSE_UP)
+                          | (1 << K_CG_EVENT_LEFT_MOUSE_DRAGGED) | (1 << K_CG_EVENT_MOUSE_MOVED)
+                          | (1 << K_CG_EVENT_KEY_DOWN) | (1 << K_CG_EVENT_SCROLL_WHEEL);
 
-    // Thêm mouse move, key down, scroll vào mask để track AFK
-    let mask: CGEventMask = (1 << K_CG_EVENT_LEFT_MOUSE_DOWN)
-                          | (1 << K_CG_EVENT_LEFT_MOUSE_UP)
-                          | (1 << K_CG_EVENT_LEFT_MOUSE_DRAGGED)
-                          | (1 << K_CG_EVENT_MOUSE_MOVED)
-                          | (1 << K_CG_EVENT_KEY_DOWN)
-                          | (1 << K_CG_EVENT_SCROLL_WHEEL);
-
-    let tap = CGEventTapCreate(
-        K_CG_SESSION_EVENT_TAP,
-        K_CG_HEAD_INSERT_EVENT_TAP,
-        K_CG_EVENT_TAP_OPTION_DEFAULT,
-        mask,
-        event_callback,
-        ctx_ptr,
-    );
-
-    if tap.is_null() {
-        println!("[PET] ❌ CGEventTapCreate failed — cần Accessibility permission!");
-        return;
-    }
-
-    println!("[PET] ✅ CGEventTap ready (click + drag + AFK tracking)");
+    let tap = CGEventTapCreate(K_CG_SESSION_EVENT_TAP, K_CG_HEAD_INSERT_EVENT_TAP, 0, mask, event_callback, ctx_ptr);
+    if tap.is_null() { return; }
     CGEventTapEnable(tap, true);
-
     let source = CFMachPortCreateRunLoopSource(std::ptr::null(), tap, 0);
     let rl = CFRunLoopGetCurrent();
     CFRunLoopAddSource(rl, source, kCFRunLoopCommonModes);
@@ -369,133 +326,140 @@ unsafe fn run_event_tap(
 }
 
 #[tauri::command]
-fn update_pet_rect(
-    state: tauri::State<Arc<Mutex<PetRect>>>,
-    x: f64, y: f64, w: f64, h: f64,
-) {
+fn update_pet_rect(state: tauri::State<Arc<Mutex<PetRect>>>, x: f64, y: f64, w: f64, h: f64) {
     let mut r = state.lock().unwrap();
-    let changed = (r.x - x).abs() > 1.0 || (r.y - y).abs() > 1.0;
-    if changed {
-        println!("[PET] 📦 rect => ({:.0},{:.0} {}x{})", x, y, w as i32, h as i32);
-    }
     r.x = x; r.y = y; r.w = w; r.h = h;
 }
 
+// =============================================
+// Panel Logic
+// =============================================
+
+const PANEL_W: f64 = 300.0;
+// ĐÃ CHỈNH LẠI ĐÚNG VỪA VẶN CHIỀU CAO CONTENT CỦA PANEL
+const PANEL_H: f64 = 410.0;
+
+fn toggle_panel(app: &tauri::AppHandle, tray_x: f64, tray_y: f64) {
+    let scale = app.primary_monitor().ok().flatten().map(|m| m.scale_factor()).unwrap_or(1.0);
+    let px = (tray_x / scale - PANEL_W / 2.0).max(4.0);
+    let py = tray_y / scale;
+
+    if let Some(panel) = app.get_webview_window("panel") {
+        if panel.is_visible().unwrap_or(false) {
+            let _ = panel.hide();
+        } else {
+            let _ = panel.set_position(tauri::LogicalPosition::new(px, py));
+            let _ = panel.show();
+            let _ = panel.set_focus();
+        }
+        return;
+    }
+
+    if let Ok(panel) = WebviewWindowBuilder::new(app, "panel", WebviewUrl::App("/panel".into()))
+        .title("")
+        .inner_size(PANEL_W, PANEL_H)
+        .position(px, py)
+        .resizable(false)
+        .decorations(false)
+        .transparent(true)
+        .always_on_top(true)
+        .shadow(false)
+        .build()
+    {
+        // Lắng nghe sự kiện mất focus chuẩn
+        let panel_clone = panel.clone();
+        panel.on_window_event(move |event| {
+            if let tauri::WindowEvent::Focused(false) = event {
+                let _ = panel_clone.hide();
+            }
+        });
+
+        let _ = panel.show();
+        let _ = panel.set_focus();
+    }
+}
+
 fn setup_tray(app: &mut App) -> tauri::Result<()> {
-    let quit   = MenuItemBuilder::with_id("quit",   "Quit").build(app)?;
-    let toggle = MenuItemBuilder::with_id("toggle", "Show/Hide").build(app)?;
-    let menu   = MenuBuilder::new(app).items(&[&toggle, &quit]).build()?;
+    let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
+    let menu = MenuBuilder::new(app).items(&[&quit]).build()?;
     TrayIconBuilder::new()
         .icon(app.default_window_icon().unwrap().clone())
         .menu(&menu)
+        .menu_on_left_click(false)
         .tooltip("Pet App")
-        .on_menu_event(|app, event| match event.id.as_ref() {
-            "quit"   => app.exit(0),
-            "toggle" => {
-                if let Some(w) = app.get_webview_window("pet") {
-                    if w.is_visible().unwrap_or(false) { let _ = w.hide(); }
-                    else                               { let _ = w.show(); }
-                }
+        .on_tray_icon_event(|tray, event| {
+            if let tauri::tray::TrayIconEvent::Click { button: tauri::tray::MouseButton::Left, button_state: tauri::tray::MouseButtonState::Up, position, .. } = event {
+                toggle_panel(tray.app_handle(), position.x, position.y);
             }
-            _ => {}
         })
+        .on_menu_event(|app, event| { if event.id.as_ref() == "quit" { app.exit(0); } })
         .build(app)?;
     Ok(())
 }
 
 fn setup_pet_window(app: &mut App) -> tauri::Result<()> {
     let (sw, sh) = if let Ok(Some(m)) = app.primary_monitor() {
-        let s = m.scale_factor();
-        println!("[PET] monitor scale={} logical={}x{}",
-            s, m.size().width as f64 / s, m.size().height as f64 / s);
-        (m.size().width as f64 / s, m.size().height as f64 / s)
-    } else {
-        println!("[PET] no monitor, fallback 1440x900");
-        (1440.0, 900.0)
-    };
+        let s = m.scale_factor(); (m.size().width as f64 / s, m.size().height as f64 / s)
+    } else { (1440.0, 900.0) };
 
     let window = WebviewWindowBuilder::new(app, "pet", WebviewUrl::App("/".into()))
-        .title("")
-        .inner_size(sw, sh)
-        .position(0.0, 0.0)
-        .decorations(false)
-        .transparent(true)
-        .always_on_top(true)
-        .resizable(false)
-        .shadow(false)
-        .visible_on_all_workspaces(true)
-        .build()?;
-
+        .title("").inner_size(sw, sh).position(0.0, 0.0).decorations(false).transparent(true)
+        .always_on_top(true).resizable(false).shadow(false).visible_on_all_workspaces(true).build()?;
     window.show()?;
     let _ = window.set_ignore_cursor_events(true);
 
     #[cfg(target_os = "macos")]
     unsafe {
-        set_window_above_fullscreen(&window);
+        use objc2::msg_send;
+        use objc2::runtime::AnyObject;
+        if let Ok(ptr) = window.ns_window() {
+            let ns_win = ptr as *mut AnyObject;
+            let _: () = msg_send![ns_win, setLevel: 25_isize];
+            let behavior: usize = 1 | 16 | 64 | 256;
+            let _: () = msg_send![ns_win, setCollectionBehavior: behavior];
+        }
     }
-
-    println!("[PET] ✅ window ready (above fullscreen)");
     Ok(())
 }
 
-
-#[cfg(target_os = "macos")]
-unsafe fn set_window_above_fullscreen(window: &tauri::WebviewWindow) {
-    use objc2::msg_send;
-    use objc2::runtime::AnyObject;
-
-    let ns_win = match window.ns_window() {
-        Ok(ptr) => ptr as *mut AnyObject, // Ép sang AnyObject của objc2
-        Err(_) => return,
-    };
-
-    let _: () = msg_send![ns_win, setLevel: 25_isize]; // objc2 thích isize/usize hơn
-    
-    let behavior: usize = 1 | 16 | 64 | 256;
-    let _: () = msg_send![ns_win, setCollectionBehavior: behavior];
-}
-
-
 #[tauri::command]
-fn get_windows() -> Vec<WindowInfo> {
-    windows::fetch_windows()
+fn toggle_pet(app: tauri::AppHandle, visible: bool) {
+    if let Some(w) = app.get_webview_window("pet") {
+        if !visible {
+            if let Some(state) = app.try_state::<Arc<Mutex<PetRect>>>() {
+                let mut r = state.lock().unwrap(); r.x = -9999.0; r.y = -9999.0; r.w = 0.0; r.h = 0.0;
+            }
+            let _ = w.eval("window.__onPetHide && window.__onPetHide()");
+        } else {
+            let _ = w.eval("window.__onPetShow && window.__onPetShow()");
+        }
+    }
 }
 
+#[tauri::command] fn quit_app(app: tauri::AppHandle) { app.exit(0); }
+#[tauri::command] fn get_windows() -> Vec<WindowInfo> { windows::fetch_windows() }
 #[tauri::command]
 fn request_accessibility() -> bool {
     #[cfg(target_os = "macos")]
     unsafe {
         use std::os::raw::c_void;
-        type CFDictionaryRef = *const c_void;
-        type CFStringRef     = *const c_void;
-        type CFTypeRef       = *const c_void;
-        type Boolean         = u8;
-
+        type CFDictionaryRef = *const c_void; type CFStringRef = *const c_void; type CFTypeRef = *const c_void;
         #[link(name = "CoreFoundation", kind = "framework")]
         extern "C" {
-            fn CFDictionaryCreateMutable(
-                alloc: *const c_void, cap: isize,
-                kc: *const c_void, vc: *const c_void,
-            ) -> CFDictionaryRef;
-            fn CFDictionaryAddValue(dict: CFDictionaryRef, key: CFTypeRef, val: CFTypeRef);
-            fn CFRelease(cf: CFTypeRef);
-            static kCFBooleanTrue: CFTypeRef;
+            fn CFDictionaryCreateMutable(a: *const c_void, c: isize, kc: *const c_void, vc: *const c_void) -> CFDictionaryRef;
+            fn CFDictionaryAddValue(d: CFDictionaryRef, k: CFTypeRef, v: CFTypeRef);
+            fn CFRelease(cf: CFTypeRef); static kCFBooleanTrue: CFTypeRef;
         }
         #[link(name = "ApplicationServices", kind = "framework")]
         extern "C" {
-            fn AXIsProcessTrustedWithOptions(options: CFDictionaryRef) -> Boolean;
+            fn AXIsProcessTrustedWithOptions(o: CFDictionaryRef) -> u8;
             static kAXTrustedCheckOptionPrompt: CFStringRef;
         }
-
-        let dict = CFDictionaryCreateMutable(
-            std::ptr::null(), 1, std::ptr::null(), std::ptr::null(),
-        );
+        let dict = CFDictionaryCreateMutable(std::ptr::null(), 1, std::ptr::null(), std::ptr::null());
         CFDictionaryAddValue(dict, kAXTrustedCheckOptionPrompt, kCFBooleanTrue);
         let trusted = AXIsProcessTrustedWithOptions(dict) != 0;
         CFRelease(dict);
-        println!("[PET] accessibility trusted={}", trusted);
         trusted
     }
-    #[cfg(not(target_os = "macos"))]
-    false
+    #[cfg(not(target_os = "macos"))] false
 }
