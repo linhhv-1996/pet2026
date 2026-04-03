@@ -27,7 +27,7 @@
   const SLEEP_INTERRUPTIBLE = new Set<PetState>(["Idle","Idle2","Idle(Bug)","Sit(Idle)","Run","Shock"]);
   const HURT_INTERRUPTIBLE  = new Set<PetState>(["Idle","Idle2","Idle(Bug)","Sit","Sit(Idle)","Stand","Shock","Run"]);
   const IDLE_GROUP          = new Set<PetState>(["Idle","Idle2","Idle(Bug)","Sit(Idle)"]);
-  
+
   const FROGS = ["Frog_1", "Frog_2", "Frog_3", "Frog_4"] as const;
   type FrogId = (typeof FROGS)[number];
 
@@ -50,13 +50,13 @@
     const savedX = petX, savedY = petY;
 
     pet.destroy();
-    
+
     pet = new PetSprite(`/${frog}.json`, `/${frog}.png`, FRAME_COUNTS);
     await pet.load(pixiApp, DISPLAY);
 
     pet.setPosition(savedX, savedY);
     pet.facingLeft = wasFacingLeft;
-    
+
     state = "Idle";
     pixiApp.ticker.add(gameTick);
     enterState("Idle");
@@ -90,6 +90,13 @@
   let petBody: Matter.Body;
   let isPetHidden = false;
 
+  // ── Focus mode ────────────────────────────────────────────────
+  let isFocusMode = false;
+  let focusTimer: ReturnType<typeof setTimeout> | null = null;
+  let focusEndTime = 0;
+  let timerText: PIXI.Text | null = null;
+  // ─────────────────────────────────────────────────────────────
+
   function isIdling()   { return IDLE_GROUP.has(state); }
   function isSleeping() { return state === "Sleep(Start)" || state === "Sleep" || state === "Awake"; }
   function isDragging() { return state === "Dragging"; }
@@ -99,6 +106,7 @@
     clearTimeout(behaviorTimer);
     clearTimeout(attackFallbackTimer);
     if (stunTimer) { clearTimeout(stunTimer); stunTimer = null; }
+    isFocusRunning = false;
     attackCooldown = false;
   }
 
@@ -119,8 +127,10 @@
     clearTimeout(bubbleTimer);
     bubbleTimer = setTimeout(() => {
       if (!bubble) { scheduleBubble(); return; }
+      if (isFocusMode) { scheduleBubble(); return; }
       const secs = (Date.now() - idleStartTime) / 1000;
-      if (isSleeping()) showMood("sleep");
+      // Chỉ show sleep mood nếu đã ngủ đủ lâu (tránh Zzz ngay sau khi vừa dậy)
+      if (isSleeping() && secs > 15) showMood("sleep");
       else if (isIdling())
         showMood(secs > 30 ? (Math.random() < 0.5 ? "hungry" : "bored") : (Math.random() < 0.5 ? "idle" : "happy"));
       scheduleBubble();
@@ -141,7 +151,169 @@
   function enterSleep() { clearBehavior(); playOnce("Sleep(Start)", () => enterState("Sleep")); }
   function exitSleep()  { bubble?.hide(); playOnce("Awake", () => { enterState("Idle"); scheduleNextBehavior(); }); }
 
+  // ── Focus: enter / exit ───────────────────────────────────────
+  let isFocusRunning = false; // đang chạy về mép trái trước khi ngủ
+
+  const FOCUS_EDGE_X = 30;
+
+  function runToEdgeThenSleep() {
+    // Đã gần mép rồi → ngủ luôn
+    if (petX <= FOCUS_EDGE_X + 10) {
+      isFocusRunning = false;
+      Matter.Body.setVelocity(petBody, { x: 0, y: petBody.velocity.y });
+      enterSleep();
+      return;
+    }
+    // Đặt flag, gameTick sẽ lo phần còn lại
+    isFocusRunning = true;
+    pet.facingLeft = true;
+    Matter.Body.setVelocity(petBody, { x: -WALK_SPEED, y: petBody.velocity.y });
+    enterState("Run");
+  }
+
+  function enterFocus(mins: number) {
+    isFocusMode = true;
+    clearBehavior();
+    bubble?.hide();
+    focusEndTime = Date.now() + mins * 60 * 1000;
+
+    // Tạo PIXI.Text countdown trên đầu ếch
+    if (!timerText) {
+      timerText = new PIXI.Text({
+        text: '',
+        style: {
+          fontFamily: '"Press Start 2P"',
+          fontSize: 9,
+          fill: 0xffffff,
+          stroke: { color: 0x000000, width: 4, join: 'round' },
+          align: 'center',
+        },
+        resolution: 1,
+      });
+      timerText.roundPixels = true;
+      pixiApp.stage.addChild(timerText);
+    }
+
+    // Chạy ra mép trái rồi mới ngủ
+    runToEdgeThenSleep();
+
+    // Auto kết thúc sau đúng thời gian
+    if (focusTimer) clearTimeout(focusTimer);
+    focusTimer = setTimeout(() => exitFocus(true), mins * 60 * 1000);
+  }
+
+  function exitFocus(completed: boolean) {
+    isFocusMode = false;
+    isFocusRunning = false;
+
+    if (focusTimer) { clearTimeout(focusTimer); focusTimer = null; }
+
+    // Xoá countdown text
+    if (timerText) {
+      pixiApp.stage.removeChild(timerText);
+      timerText.destroy();
+      timerText = null;
+    }
+
+    // Thông báo lại cho panel để reset UI
+    (window as any).__onFocusEnded?.();
+
+    if (completed) {
+      focusCelebrate();
+    } else {
+      // Stop thủ công → dậy bình thường
+      idleStartTime = Date.now(); // reset để scheduleBubble không show "Zzz" ngay
+      if (isSleeping()) {
+        exitSleep();
+      } else {
+        scheduleNextBehavior();
+      }
+    }
+  }
+
+  // ── Celebrate state machine ──────────────────────────────────
+  // step: 0=off  1=chạy ra giữa  2=ẩn ếch+hiện text  3=ẩn text+hiện ếch
+  let celebrateStep = 0;
+  let celebratePhaseStart = 0;
+  let celebrateText: PIXI.Text | null = null;
+  const CELEBRATE_SHOW_MS = 4000;
+
+  function focusCelebrate() {
+    celebrateStep = 0;
+    idleStartTime = Date.now();
+
+    playOnce("Awake", () => {
+      const cx = window.innerWidth / 2 - DISPLAY / 2;
+      pet.facingLeft = petX > cx;
+      Matter.Body.setVelocity(petBody, {
+        x: pet.facingLeft ? -WALK_SPEED * 1.5 : WALK_SPEED * 1.5,
+        y: petBody.velocity.y,
+      });
+      enterState("Run");
+      celebrateStep = 1;
+    });
+  }
+
+  function celebrateTick() {
+    if (celebrateStep === 0) return;
+    const now = Date.now();
+
+    // Step 1 — chạy ra giữa
+    if (celebrateStep === 1) {
+      const cx = window.innerWidth / 2 - DISPLAY / 2;
+      Matter.Body.setVelocity(petBody, {
+        x: pet.facingLeft ? -WALK_SPEED * 1.5 : WALK_SPEED * 1.5,
+        y: petBody.velocity.y,
+      });
+      const reached = pet.facingLeft ? petX <= cx : petX >= cx;
+      if (!reached) return;
+
+      // Đến nơi → dừng, ẩn ếch, hiện text
+      Matter.Body.setVelocity(petBody, { x: 0, y: petBody.velocity.y });
+      enterState("Idle");
+      pet.container.visible = false;
+
+      if (!celebrateText) {
+        celebrateText = new PIXI.Text({
+          text: `Well done! 🎉\nTime to take a break~`,
+          style: {
+            fontFamily: '"Press Start 2P"',
+            fontSize: 40,
+            fill: 0xffffff,
+            stroke: { color: 0x000000, width: 6, join: 'round' },
+            align: 'center',
+            lineHeight: 40,
+          },
+          resolution: 1,
+        });
+        celebrateText.roundPixels = true;
+        pixiApp.stage.addChild(celebrateText);
+      }
+      celebrateText.visible = true;
+      celebrateText.x = Math.round(window.innerWidth / 2 - celebrateText.width / 2);
+      celebrateText.y = Math.round(window.innerHeight / 2 - celebrateText.height / 2);
+
+      celebrateStep = 2;
+      celebratePhaseStart = now;
+      return;
+    }
+
+    // Step 2 — giữ text, đợi
+    if (celebrateStep === 2) {
+      if (now - celebratePhaseStart < CELEBRATE_SHOW_MS) return;
+
+      // Ẩn text, hiện lại ếch
+      if (celebrateText) { celebrateText.visible = false; }
+      pet.container.visible = true;
+      celebrateStep = 0;
+      scheduleNextBehavior();
+    }
+  }
+  // ─────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────
+
   function scheduleNextBehavior() {
+    if (isFocusMode) return; // ← lock khi focus
     clearBehavior();
     if (!isIdling()) return;
     if (Math.random() < 0.3) {
@@ -201,7 +373,11 @@
           collisionCooldownTicks = COLLISION_COOLDOWN;
           clearBehavior();
           const vol = Math.min(1, speed / 20);
-          if (speed > 18) {
+          if (isFocusMode) {
+            // Bị đập khi focus → không Hurt/Death, chạy về mép ngủ tiếp
+            Matter.Body.setVelocity(petBody, { x: 0, y: 0 });
+            runToEdgeThenSleep();
+          } else if (speed > 18) {
             playOnce("Death", () => { pet.freeze(); });
             Matter.Body.applyForce(petBody, petBody.position, {
               x: (Math.random() - 0.5) * 0.02, y: -0.01 * vol,
@@ -225,20 +401,31 @@
     if (!isDragging()) {
       prevVx = petBody.velocity.x;
       prevVy = petBody.velocity.y;
-      
-      // FIX LỖI NỔ VẬT LÝ KHI LAG/MỚI BẬT: Giới hạn tối đa bước nhảy thời gian là 32ms
+
       const safeDelta = Math.min(ticker.deltaMS, 32);
       Matter.Engine.update(engine, safeDelta);
-      
+
       if (collisionCooldownTicks > 0) collisionCooldownTicks--;
-      
+
       if (state === "Run") {
         const cx = petBody.position.x;
-        if (cx < 60 && pet.facingLeft) pet.facingLeft = false;
-        else if (cx > window.innerWidth - 60 && !pet.facingLeft) pet.facingLeft = true;
-        Matter.Body.setVelocity(petBody, {
-          x: pet.facingLeft ? -WALK_SPEED : WALK_SPEED, y: petBody.velocity.y,
-        });
+        if (isFocusRunning) {
+          // Đang chạy về mép trái cho focus — giữ velocity, không flip hướng
+          Matter.Body.setVelocity(petBody, { x: -WALK_SPEED, y: petBody.velocity.y });
+          if (petX <= FOCUS_EDGE_X) {
+            isFocusRunning = false;
+            Matter.Body.setVelocity(petBody, { x: 0, y: petBody.velocity.y });
+            enterSleep();
+          }
+        } else if (celebrateStep === 1) {
+          // đang chạy ra giữa — celebrateTick lo velocity, không làm gì thêm
+        } else {
+          if (cx < 60 && pet.facingLeft) pet.facingLeft = false;
+          else if (cx > window.innerWidth - 60 && !pet.facingLeft) pet.facingLeft = true;
+          Matter.Body.setVelocity(petBody, {
+            x: pet.facingLeft ? -WALK_SPEED : WALK_SPEED, y: petBody.velocity.y,
+          });
+        }
       }
 
       if (state === "Death") {
@@ -246,7 +433,11 @@
           if (!stunTimer) {
             stunTimer = setTimeout(() => {
               stunTimer = null; attackCooldown = false;
-              playOnce("Awake", () => { enterState("Idle"); scheduleNextBehavior(); });
+              if (isFocusMode) {
+                runToEdgeThenSleep();
+              } else {
+                playOnce("Awake", () => { enterState("Idle"); scheduleNextBehavior(); });
+              }
             }, 2000);
           }
         } else if (stunTimer) { clearTimeout(stunTimer); stunTimer = null; }
@@ -255,20 +446,41 @@
       petX = petBody.position.x - DISPLAY / 2;
       petY = petBody.position.y + 35 - DISPLAY + BOTTOM_GAP;
       if (!isLocked() && Math.abs(petBody.velocity.x) > 0.5) pet.facingLeft = petBody.velocity.x < 0;
-      
+
       if (petBody.velocity.y > 4 && !isLocked() && state !== "Fall") enterState("Fall");
       if (state === "Fall" && Math.abs(petBody.velocity.y) < 1.5) {
         collisionCooldownTicks = COLLISION_COOLDOWN;
-        playOnce("Landing", () => { enterState("Idle"); scheduleNextBehavior(); });
+        if (isFocusMode) {
+          // Đáp xuống đất khi focus → chạy về mép rồi ngủ tiếp
+          runToEdgeThenSleep();
+        } else {
+          playOnce("Landing", () => { enterState("Idle"); scheduleNextBehavior(); });
+        }
       }
     }
 
     pet.setPosition(petX, petY);
     bubble?.updatePosition(pet.container.x + DISPLAY / 2, pet.getHeadY());
     maybeUpdateRect();
+    celebrateTick();
+
+    // ── Render countdown timer trên đầu ếch ──────────────────
+    if (isFocusMode && timerText) {
+      const remaining = Math.max(0, focusEndTime - Date.now());
+      const m = Math.floor(remaining / 60000);
+      const s = Math.floor((remaining % 60000) / 1000);
+      timerText.text = `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+
+      const cx = pet.container.x + DISPLAY / 2;
+      const hy = pet.getHeadY();
+      timerText.x = Math.round(cx - timerText.width / 2);
+      timerText.y = Math.round(hy - timerText.height - 10);
+    }
+    // ─────────────────────────────────────────────────────────
   }
 
   function checkCursorAttack(mouseX: number, mouseY: number) {
+    if (isFocusMode) return; // ← lock khi focus
     if (isDragging() || attackCooldown) return;
     const canAttack = isIdling() || ["Shock","Fall","Run"].includes(state);
     if (!canAttack) return;
@@ -288,6 +500,7 @@
   }
 
   function handlePetClick() {
+    if (isFocusMode) return; // ← lock khi focus
     if (isDragging()) return;
     if (isSleeping()) { exitSleep(); return; }
     if (["Jump","Fall","Landing","Glide","Death","Attack","AttackUp"].includes(state)) return;
@@ -341,10 +554,17 @@
     scheduleBubble();
 
     (window as any).__onFrogChanged = (frog: string) => { reloadSprite(frog as FrogId); };
-    (window as any).__onMouseMove    = (x: number, y: number) => checkCursorAttack(x, y);
-    (window as any).__onPetClicked   = () => handlePetClick();
+    (window as any).__onMouseMove   = (x: number, y: number) => checkCursorAttack(x, y);
+    (window as any).__onPetClicked  = () => handlePetClick();
 
     (window as any).__onPetDragStart = () => {
+      if (isFocusMode) {
+        // Đang ngủ focus → chỉ ghi nhận vị trí để drag im lặng, không hiệu ứng
+        isFocusRunning = false;
+        dragLastX = petX; dragLastY = petY; dragVx = 0; dragVy = 0;
+        state = "Dragging";
+        return;
+      }
       clearBehavior(); if (stunTimer) { clearTimeout(stunTimer); stunTimer = null; }
       state = "Dragging"; pet.playOnce("Shock", () => { if (isDragging()) pet.play("Shock"); });
       showMood("scared", 1200); dragLastX = petX; dragLastY = petY; dragVx = 0; dragVy = 0;
@@ -355,12 +575,21 @@
       Matter.Body.setVelocity(petBody, { x: 0, y: 0 });
       dragVx = x - dragLastX; dragVy = y - dragLastY; dragLastX = x; dragLastY = y; petX = x; petY = y;
     };
-    
+
     (window as any).__onPetDragEnd = () => {
+      if (isFocusMode) {
+        // Thả ra khi focus → đặt xuống nhẹ nhàng rồi chạy về mép ngủ tiếp
+        isThrown = false;
+        Matter.Body.setVelocity(petBody, { x: 0, y: 2 }); // rơi nhẹ xuống đất
+        collisionCooldownTicks = 0;
+        invoke("update_pet_rect", { x: petX, y: petY, w: DISPLAY, h: DISPLAY });
+        // Đợi chạm đất xong (Landing sẽ bị bắt ở gameTick → runToEdgeThenSleep)
+        return;
+      }
       bubble?.hide(); collisionCooldownTicks = 0;
       const speed = Math.hypot(dragVx, dragVy);
       const isThrownHorizontalOrDown = speed > 6 && dragVy > -3;
-      
+
       if (isThrownHorizontalOrDown) {
         isThrown = true; const factor = Math.min(1.2, MAX_THROW / speed);
         Matter.Body.setVelocity(petBody, { x: dragVx * factor, y: dragVy * factor });
@@ -370,16 +599,25 @@
       playOnce("Shock", () => enterState("Fall"));
       invoke("update_pet_rect", { x: petX, y: petY, w: DISPLAY, h: DISPLAY });
     };
-    
-    (window as any).__onUserAFK    = () => { if (isDragging() || isSleeping()) return; if (!SLEEP_INTERRUPTIBLE.has(state)) return; enterSleep(); };
-    (window as any).__onUserActive = () => { if (!isSleeping()) return; exitSleep(); };
+
+    (window as any).__onUserAFK    = () => {
+      if (isFocusMode) return; // ← ếch đang ngủ focus rồi, không cần xử lý
+      if (isDragging() || isSleeping()) return;
+      if (!SLEEP_INTERRUPTIBLE.has(state)) return;
+      enterSleep();
+    };
+    (window as any).__onUserActive = () => {
+      if (isFocusMode) return; // ← không wake up giữa chừng
+      if (!isSleeping()) return;
+      exitSleep();
+    };
     (window as any).__onWindowsUpdated = (wins: WinInfo[]) => { openWindows = wins; };
-    
+
     (window as any).__onPetHide = () => {
       isPetHidden = true; clearBehavior(); clearTimeout(bubbleTimer); bubble?.hide();
       pet.container.visible = false; invoke("update_pet_rect", { x: -9999, y: -9999, w: 0, h: 0 });
     };
-    
+
     (window as any).__onPetShow = () => {
       isPetHidden = false; pet.container.visible = true; petX = 200; petY = getGroundY() - 200;
       Matter.Body.setPosition(petBody, { x: petX + DISPLAY / 2, y: petY + DISPLAY - BOTTOM_GAP - 35 });
@@ -387,17 +625,30 @@
       invoke("update_pet_rect", { x: petX, y: petY, w: DISPLAY, h: DISPLAY });
       enterState("Fall"); scheduleNextBehavior(); scheduleBubble();
     };
+
+    // ── Focus mode handlers ───────────────────────────────────
+    // Rust gọi khi panel invoke start_focus
+    (window as any).__onFocusStart = (mins: number) => enterFocus(mins);
+    // Rust gọi mỗi giây — pet dùng để update PIXI text (đã xử lý trong gameTick qua focusEndTime, tick này bỏ qua)
+    (window as any).__onFocusTick  = (_secsLeft: number) => { /* gameTick tự tính từ focusEndTime */ };
+    // Rust gọi khi hết giờ (completed=true) hoặc stop (completed=false)
+    (window as any).__onFocusEnd   = (completed: boolean) => exitFocus(completed);
+    // ─────────────────────────────────────────────────────────
   });
 
   onDestroy(() => {
     Matter.Engine.clear(engine); if (engine?.world) Matter.Composite.clear(engine.world, false);
     clearBehavior(); clearTimeout(clickTimer); clearTimeout(bubbleTimer);
+    if (focusTimer) clearTimeout(focusTimer);
+    if (timerText) { timerText.destroy(); timerText = null; }
+    if (celebrateText) { celebrateText.destroy(); celebrateText = null; }
     bubble?.destroy(); pet.destroy(); canvasEl?.remove(); pixiApp?.destroy(true);
     const w = window as any;
-    delete w.__onFrogChanged; delete w.__onPetClicked; delete w.__onPetDragStart; 
-    delete w.__onPetDrag; delete w.__onPetDragEnd; delete w.__onUserAFK; 
+    delete w.__onFrogChanged; delete w.__onPetClicked; delete w.__onPetDragStart;
+    delete w.__onPetDrag; delete w.__onPetDragEnd; delete w.__onUserAFK;
     delete w.__onUserActive; delete w.__onWindowsUpdated; delete w.__onMouseMove;
     delete w.__onPetHide; delete w.__onPetShow;
+    delete w.__onFocusStart; delete w.__onFocusTick; delete w.__onFocusEnd;
   });
 </script>
 

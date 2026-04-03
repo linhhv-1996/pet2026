@@ -40,12 +40,38 @@ impl Default for AppSettings {
     }
 }
 
+/// State của focus session — None = không có session nào đang chạy
+#[derive(Debug, Clone, Default)]
+struct FocusState {
+    /// Thời điểm session kết thúc. None = không focus.
+    end_at: Option<Instant>,
+}
+
+impl FocusState {
+    fn start(&mut self, mins: u32) {
+        self.end_at = Some(Instant::now() + Duration::from_secs(mins as u64 * 60));
+    }
+    fn stop(&mut self) {
+        self.end_at = None;
+    }
+    fn is_active(&self) -> bool {
+        self.end_at.is_some()
+    }
+    fn secs_left(&self) -> Option<u64> {
+        self.end_at.map(|e| {
+            let now = Instant::now();
+            if e > now { (e - now).as_secs() } else { 0 }
+        })
+    }
+}
+
 const AFK_THRESHOLD_SECS: u64 = 45;
 
 pub fn run() {
-    let pet_rect   = Arc::new(Mutex::new(PetRect::default()));
-    let last_input = Arc::new(Mutex::new(Instant::now()));
-    let settings   = Arc::new(Mutex::new(AppSettings::default()));
+    let pet_rect    = Arc::new(Mutex::new(PetRect::default()));
+    let last_input  = Arc::new(Mutex::new(Instant::now()));
+    let settings    = Arc::new(Mutex::new(AppSettings::default()));
+    let focus_state = Arc::new(Mutex::new(FocusState::default()));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -58,6 +84,9 @@ pub fn run() {
             get_settings,
             toggle_pet,
             quit_app,
+            start_focus,
+            stop_focus,
+            get_focus_state,
         ])
         .setup(move |app| {
             #[cfg(target_os = "macos")]
@@ -69,6 +98,7 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
+            // Thread: push danh sách cửa sổ sang pet mỗi 500ms
             let handle = app.handle().clone();
             thread::spawn(move || loop {
                 thread::sleep(Duration::from_millis(500));
@@ -81,6 +111,7 @@ pub fn run() {
                 }
             });
 
+            // Thread: event tap (mouse/keyboard) — macOS only
             let handle2     = app.handle().clone();
             let rect2       = Arc::clone(&pet_rect);
             let last_input2 = Arc::clone(&last_input);
@@ -89,17 +120,100 @@ pub fn run() {
                 unsafe { run_event_tap(handle2, rect2, last_input2); }
             });
 
+            // Thread: AFK watcher
             let handle3     = app.handle().clone();
             let last_input3 = Arc::clone(&last_input);
             thread::spawn(move || { afk_watcher(handle3, last_input3); });
 
+            // Thread: Focus timer — tick mỗi giây, emit secs_left sang cả pet lẫn panel
+            let handle4      = app.handle().clone();
+            let focus_state4 = Arc::clone(&focus_state);
+            thread::spawn(move || { focus_ticker(handle4, focus_state4); });
+
             app.manage(Arc::clone(&pet_rect));
             app.manage(Arc::clone(&settings));
+            app.manage(Arc::clone(&focus_state));
             Ok(())
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+// ── Focus ticker ──────────────────────────────────────────────────────────────
+
+fn focus_ticker(handle: tauri::AppHandle, focus_state: Arc<Mutex<FocusState>>) {
+    loop {
+        thread::sleep(Duration::from_secs(1));
+
+        let secs = { focus_state.lock().unwrap().secs_left() };
+
+        let Some(secs_left) = secs else { continue };
+
+        // Push secs_left sang pet (hiện countdown trên đầu ếch)
+        if let Some(w) = handle.get_webview_window("pet") {
+            let js = format!("window.__onFocusTick && window.__onFocusTick({})", secs_left);
+            let _ = w.eval(&js);
+        }
+
+        // Push secs_left sang panel (cập nhật countdown trong UI)
+        if let Some(p) = handle.get_webview_window("panel") {
+            let js = format!("window.__onFocusTick && window.__onFocusTick({})", secs_left);
+            let _ = p.eval(&js);
+        }
+
+        // Hết giờ → kết thúc session
+        if secs_left == 0 {
+            focus_state.lock().unwrap().stop();
+
+            if let Some(w) = handle.get_webview_window("pet") {
+                let _ = w.eval("window.__onFocusEnd && window.__onFocusEnd(true)");
+            }
+            if let Some(p) = handle.get_webview_window("panel") {
+                let _ = p.eval("window.__onFocusEnd && window.__onFocusEnd(true)");
+            }
+        }
+    }
+}
+
+// ── Focus commands ────────────────────────────────────────────────────────────
+
+/// Panel gọi khi nhấn Start — Rust bật timer, emit __onFocusStart sang pet
+#[tauri::command]
+fn start_focus(
+    mins: u32,
+    app: tauri::AppHandle,
+    focus_state: tauri::State<Arc<Mutex<FocusState>>>,
+) {
+    focus_state.lock().unwrap().start(mins);
+
+    if let Some(w) = app.get_webview_window("pet") {
+        let js = format!("window.__onFocusStart && window.__onFocusStart({})", mins);
+        let _ = w.eval(&js);
+    }
+}
+
+/// Panel gọi khi nhấn Stop — Rust dừng timer, emit __onFocusEnd sang pet
+#[tauri::command]
+fn stop_focus(
+    app: tauri::AppHandle,
+    focus_state: tauri::State<Arc<Mutex<FocusState>>>,
+) {
+    focus_state.lock().unwrap().stop();
+
+    if let Some(w) = app.get_webview_window("pet") {
+        let _ = w.eval("window.__onFocusEnd && window.__onFocusEnd(false)");
+    }
+}
+
+/// Panel gọi khi mount để khôi phục UI nếu app vẫn đang focus (panel bị đóng/mở lại)
+#[tauri::command]
+fn get_focus_state(
+    focus_state: tauri::State<Arc<Mutex<FocusState>>>,
+) -> Option<u64> {
+    focus_state.lock().unwrap().secs_left()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[tauri::command]
 fn get_settings(settings: tauri::State<Arc<Mutex<AppSettings>>>) -> (String, u32) {
@@ -213,7 +327,7 @@ unsafe fn run_event_tap(
             let ctx = &*(user_info as *const TapContext);
             let loc = CGEventGetLocation(event);
             let is_pet_drag = *ctx.down_in_pet.lock().unwrap();
-            
+
             if !is_pet_drag {
                 *ctx.last_input.lock().unwrap() = Instant::now();
             }
@@ -223,16 +337,15 @@ unsafe fn run_event_tap(
                     let r = ctx.rect.lock().unwrap();
                     let in_pet = loc.x >= r.x && loc.x <= r.x + r.w && loc.y >= r.y && loc.y <= r.y + r.h;
                     *ctx.down_in_pet.lock().unwrap() = in_pet;
-                    
+
                     if in_pet {
                         let mut drag = ctx.drag.lock().unwrap();
                         drag.dragging = false; drag.offset_x = loc.x - r.x; drag.offset_y = loc.y - r.y;
                         drop(drag); drop(r);
-                        return std::ptr::null_mut(); // Block event
+                        return std::ptr::null_mut();
                     } else {
-                        // LOGIC ĐÓNG PANEL VÀ "NUỐT" CLICK (FIX HIỆN SPACE)
                         let mut consume_click = false;
-                        
+
                         if let Some(panel) = ctx.handle.get_webview_window("panel") {
                             if panel.is_visible().unwrap_or(false) {
                                 if let (Ok(pos), Ok(size)) = (panel.outer_position(), panel.outer_size()) {
@@ -242,7 +355,7 @@ unsafe fn run_event_tap(
                                     let pw = size.width as f64 / scale;
                                     let ph = size.height as f64 / scale;
 
-                                    let in_panel = loc.x >= px && loc.x <= px + pw 
+                                    let in_panel = loc.x >= px && loc.x <= px + pw
                                                 && loc.y >= py && loc.y <= py + ph;
 
                                     if !in_panel && loc.y > 32.0 {
@@ -259,7 +372,6 @@ unsafe fn run_event_tap(
                                     let _ = p.hide();
                                 }
                             });
-                            // Trả về null để macOS KHÔNG NHẬN ĐƯỢC cú click này nữa -> Ko bị hiện Desktop
                             return std::ptr::null_mut();
                         }
                     }
@@ -336,8 +448,7 @@ fn update_pet_rect(state: tauri::State<Arc<Mutex<PetRect>>>, x: f64, y: f64, w: 
 // =============================================
 
 const PANEL_W: f64 = 300.0;
-// ĐÃ CHỈNH LẠI ĐÚNG VỪA VẶN CHIỀU CAO CONTENT CỦA PANEL
-const PANEL_H: f64 = 410.0;
+const PANEL_H: f64 = 430.0;
 
 fn toggle_panel(app: &tauri::AppHandle, tray_x: f64, tray_y: f64) {
     let scale = app.primary_monitor().ok().flatten().map(|m| m.scale_factor()).unwrap_or(1.0);
@@ -366,7 +477,6 @@ fn toggle_panel(app: &tauri::AppHandle, tray_x: f64, tray_y: f64) {
         .shadow(false)
         .build()
     {
-        // Lắng nghe sự kiện mất focus chuẩn
         let panel_clone = panel.clone();
         panel.on_window_event(move |event| {
             if let tauri::WindowEvent::Focused(false) = event {
