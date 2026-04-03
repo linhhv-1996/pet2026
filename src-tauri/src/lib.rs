@@ -305,9 +305,17 @@ unsafe fn run_event_tap(
                 }
 
                 // Input events khác → chỉ dùng để reset AFK timer (đã xử lý ở trên)
-                K_CG_EVENT_MOUSE_MOVED
-                | K_CG_EVENT_KEY_DOWN
+                K_CG_EVENT_KEY_DOWN
                 | K_CG_EVENT_SCROLL_WHEEL => {}
+
+                K_CG_EVENT_MOUSE_MOVED => {
+                // Thêm đoạn code này để gửi tọa độ chuột toàn cầu xuống Frontend
+                    if let Some(w) = ctx.handle.get_webview_window("pet") {
+                        // Tọa độ loc là tọa độ toàn cầu từ tầng OS
+                        let js = format!("if(window.__onMouseMove) window.__onMouseMove({:.1}, {:.1});", loc.x, loc.y);
+                        let _ = w.eval(&js);
+                    }
+                }
 
                 _ => {}
             }
